@@ -1,0 +1,67 @@
+name: AYE POD FW — CI Check
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  check-version:
+    name: Verifica coerenza versione SemVer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Estrai versione da file .ino
+        run: |
+          VERSION=$(grep -h '#define FW_VERSION ' AYE_POD_v37_DEV.ino | grep -o '"[^"]*"' | tr -d '"')
+          echo "FW_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Versione trovata: $VERSION"
+
+      - name: Verifica formato SemVer
+        run: |
+          if [[ ! "$FW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERRORE: FW_VERSION '$FW_VERSION' non è in formato SemVer (X.Y.Z)"
+            exit 1
+          fi
+          echo "OK: versione $FW_VERSION in formato SemVer corretto"
+
+      - name: Verifica presenza tutti i moduli
+        run: |
+          REQUIRED="AYE_POD_v37_DEV.ino Bussola.ino GPS.ino OTA.ino Rete_Cloud.ino Utils.ino Vento.ino Visore.ino"
+          for f in $REQUIRED; do
+            if [ ! -f "$f" ]; then
+              echo "ERRORE: File mancante → $f"
+              exit 1
+            fi
+            echo "OK: $f presente"
+          done
+
+  release-tag:
+    name: Tag automatico su merge in main
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: check-version
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Estrai versione
+        run: |
+          VERSION=$(grep -h '#define FW_VERSION ' AYE_POD_v37_DEV.ino | grep -o '"[^"]*"' | tr -d '"')
+          echo "FW_VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Crea tag se non esiste
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$FW_VERSION"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG esiste già — skip"
+          else
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Tag $TAG creato"
+          fi

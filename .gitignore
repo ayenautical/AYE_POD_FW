@@ -1,0 +1,32 @@
+# =========================================================================
+# AYE POD FW — .gitignore
+# =========================================================================
+
+# ── CREDENZIALI E LOGICA INTERNA — MAI SU GITHUB ─────────────────────────
+secrets.h
+secrets.json
+.env
+.env.local
+*.env
+config/credentials.*
+
+# ── LOGICA OPERATIVA INTERNA — MAI SU GITHUB ─────────────────────────────
+CLAUDE.md
+CONTRIBUTING_INTERNAL.md
+
+# ── Build Arduino ─────────────────────────────────────────────────────────
+build/
+*.bin
+*.elf
+*.map
+/tmp/
+
+# ── macOS ──────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Editor ─────────────────────────────────────────────────────────────────
+.vscode/
+*.swp
+*.swo
