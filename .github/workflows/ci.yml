@@ -15,22 +15,22 @@ jobs:
 
       - name: Estrai versione da file .ino
         run: |
-          VERSION=$(grep -h '#define FW_VERSION ' AYE_POD_v37_DEV.ino | grep -o '"[^"]*"' | tr -d '"')
+          VERSION=$(grep '#define FW_VERSION ' AYE_POD_v37_DEV.ino | grep -o '"[^"]*"' | tr -d '"')
           echo "FW_VERSION=$VERSION" >> $GITHUB_ENV
           echo "Versione trovata: $VERSION"
 
       - name: Verifica formato SemVer
         run: |
           if [[ ! "$FW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "ERRORE: FW_VERSION '$FW_VERSION' non è in formato SemVer (X.Y.Z)"
+            echo "ERRORE: FW_VERSION non è in formato SemVer (X.Y.Z)"
             exit 1
           fi
-          echo "OK: versione $FW_VERSION in formato SemVer corretto"
+          echo "OK: versione $FW_VERSION corretta"
 
       - name: Verifica presenza tutti i moduli
         run: |
-          REQUIRED="AYE_POD_v37_DEV.ino Bussola.ino GPS.ino OTA.ino Rete_Cloud.ino Utils.ino Vento.ino Visore.ino"
-          for f in $REQUIRED; do
+          for f in AYE_POD_v37_DEV.ino Bussola.ino GPS.ino OTA.ino \
+                   Rete_Cloud.ino Utils.ino Vento.ino Visore.ino; do
             if [ ! -f "$f" ]; then
               echo "ERRORE: File mancante → $f"
               exit 1
@@ -38,30 +38,45 @@ jobs:
             echo "OK: $f presente"
           done
 
+      - name: Verifica assenza credenziali nei sorgenti
+        run: |
+          if grep -rE "supabase\.co|eyJhbGci|sb_publishable|sb_secret" \
+            --include="*.ino" --include="*.h" .; then
+            echo "ERRORE: credenziali trovate nei file sorgente"
+            exit 1
+          fi
+          echo "OK: nessuna credenziale nei sorgenti"
+
   release-tag:
     name: Tag automatico su merge in main
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: check-version
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Estrai versione
         run: |
-          VERSION=$(grep -h '#define FW_VERSION ' AYE_POD_v37_DEV.ino | grep -o '"[^"]*"' | tr -d '"')
+          VERSION=$(grep '#define FW_VERSION ' AYE_POD_v37_DEV.ino | grep -o '"[^"]*"' | tr -d '"')
           echo "FW_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Versione: $VERSION"
 
       - name: Crea tag se non esiste
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v$FW_VERSION"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG esiste già — skip"
           else
-            git config user.name "github-actions"
-            git config user.email "actions@github.com"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
             git tag "$TAG"
             git push origin "$TAG"
-            echo "Tag $TAG creato"
+            echo "✓ Tag $TAG creato"
           fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
