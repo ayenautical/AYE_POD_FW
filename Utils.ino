@@ -1,25 +1,16 @@
 // =========================================================================
 // AYE POD — Utils.ino
-// Release: V2.0.0
-// Changelog V2.0.0:
-//   - confrontaVersioniSemVer(): nuova funzione per confronto MAJOR.MINOR.PATCH
-//     Preparazione per la logica OTA (Fase 2) — non ancora chiamata in produzione
-//     in questa release. Disponibile per i test preliminari.
-//   - stampaTelemetria: aggiunto FreeHeap (test I2 — verifica memory leak) e
-//     batteria_pod%/voltage (test I3 — monitoraggio autonomia LiPo+boost 6106)
-//   - Fix: rimosso argomento g_accel_mag orfano nel printf (era passato senza
-//     placeholder corrispondente — innocuo ma disallineato, ora pulito)
-// Changelog V45.4.6 (precedente):
-//   - stampaTelemetria: refresh 1s, mostra GPS age (ms dall'ultimo fix)
-//     Utile per verificare la latenza in console durante i test
-//   - Formato: angoli interi, velocita' 1 dec — coerente con display
+// Release: V2.3.1
+//
+// Changelog V2.3.0:
+//   - stampaTelemetria: aggiunta riga WP con BTW/DTW/VMG_WP/ETA/WP_REL
+//     Visibile nel monitor seriale per debug waypoint navigation.
+//
+// Changelog V2.0.0 (precedente):
+//   - confrontaVersioniSemVer() per OTA
+//   - stampaTelemetria: FreeHeap + batteria_pod%/voltage
 // =========================================================================
 
-// ── Confronto versioni SemVer (MAJOR.MINOR.PATCH) ──────────────────────────
-// Ritorna: >0 se v1 > v2, <0 se v1 < v2, 0 se uguali
-// Uso futuro (Fase 2): il POD confronta la versione disponibile sul DB
-// con FW_VERSION corrente per decidere se avviare il download OTA.
-// Esempio: confrontaVersioniSemVer("2.1.0", "2.0.0") > 0 → aggiornamento disponibile
 int confrontaVersioniSemVer(const char* v1, const char* v2) {
   int major1=0, minor1=0, patch1=0;
   int major2=0, minor2=0, patch2=0;
@@ -30,7 +21,6 @@ int confrontaVersioniSemVer(const char* v1, const char* v2) {
   return patch1 - patch2;
 }
 
-// Wrapper: true se la versione remota è più recente della corrente
 bool aggiornamentoDisponibile(const char* versioneRemota) {
   return confrontaVersioniSemVer(versioneRemota, FW_VERSION) > 0;
 }
@@ -54,33 +44,37 @@ void stampaTelemetria() {
   if (millis() - lastPrint < 1000) return;
   lastPrint = millis();
 
-  // gpsAgeMs() definita in GPS_v45.ino — ms dall'ultimo fix valido
-  // Valore atteso a 10Hz: < 120ms. Se > 500ms: problema di drenaggio buffer.
-  // g_acc: accuratezza calibrazione BNO085 (0=non cal., 1=bassa, 2=media, 3=alta)
-  //   Se HDG resta fisso a 0 nonostante movimento fisico, controllare g_acc:
-  //   un valore 0-1 persistente indica che il sensore non si è mai calibrato
-  //   (serve muovere il POD a figura-8 — vedi avviaCalibrazioneBNO())
   Serial.printf(
-    "[TEL v2.0.0] HDG:%3d | SOG:%4.1f | COG:%3d | Dr:%+.0f | "
+    "[TEL V%s] HDG:%3d | SOG:%4.1f | COG:%3d | Dr:%+.0f | "
     "AWA:%+4.0f AWS:%4.1f | TWA:%+4.0f TWS:%4.1f | "
-    "VMGw:%.1f | SATS:%d | GPS_age:%lums | ACC:%d\n",
+    "VMGw:%.1f | SATS:%d | GPS_age:%lums | BNOacc:%.2f | ACC:%d\n",
+    FW_VERSION,
     g_head, (float)g_sog, (int)g_cog, (float)g_drift,
     (float)g_awa, (float)g_aws,
     (float)g_twa, (float)g_tws,
     (float)g_vmg_wind,
-    g_sats, gpsAgeMs(), g_acc
+    g_sats, gpsAgeMs(),
+    (float)g_accel_mag_media,
+    g_acc
   );
 
-  // ── Test I2: memoria stabile (free heap) ─────────────────────────────────
-  // Valore atteso: oscillazioni piccole (±1-2KB) per allocazioni temporanee
-  // (buffer HTTP/JSON) che vengono liberate. Un calo COSTANTE e progressivo
-  // senza mai risalire indica un memory leak.
-  Serial.printf("[MEM] FreeHeap:%u bytes\n", ESP.getFreeHeap());
+  // ── Waypoint navigation (V2.3.0) ────────────────────────────────────
+  if (g_wp_active && (g_wp_lat != 0.0 || g_wp_lon != 0.0)) {
+    uint32_t eta = g_eta_wp_sec;
+    Serial.printf(
+      "[WP] BTW:%.0f° DTW:%.3fnm VMG_WP:%.1fkn WP_REL:%+.0f° ETA:%dm%ds %s\n",
+      (float)g_btw,
+      (float)g_dtw,
+      (float)g_vmg_wp,
+      (float)g_wp_bearing_rel,
+      (int)(eta / 60), (int)(eta % 60),
+      g_wp_arrive_alert ? "*** ARRIVE ***" : ""
+    );
+  } else {
+    Serial.println("[WP] nessun waypoint attivo");
+  }
 
-  // ── Test I3: monitoraggio batteria (MAX17048 via Adafruit 6106 boost) ───
-  // cellPercent(): percentuale stimata dal fuel gauge
-  // cellVoltage(): tensione LiPo reale, più utile per seguire il decadimento
-  // lineare prima del cutoff (~3.2V) rispetto alla sola percentuale stimata
+  Serial.printf("[MEM] FreeHeap:%u bytes\n", ESP.getFreeHeap());
   Serial.printf(
     "[BATT] %.0f%% | %.2fV | uptime:%lus\n",
     maxlipo.cellPercent(), maxlipo.cellVoltage(), millis() / 1000

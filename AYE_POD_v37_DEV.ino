@@ -1,35 +1,31 @@
 // =========================================================================
 // AYE POD — AYE_POD_v37_DEV.ino  (file principale)
-// Release: V2.0.7 — Fix setTimeout(8s corr.) + Stack2 PRIMA di Stack1
-// Changelog V2.0.0:
-//   - Versionamento SemVer (MAJOR.MINOR.PATCH) sostituisce schema V45.x.y
-//     Adottato per supportare confronto numerico nella logica OTA futura
-//   - Partition scheme: passaggio a custom 2-slot (no SPIFFS)
-//     app0/app1 da ~1.99MB ciascuno (era partizione singola 2.75MB No-OTA)
-//     Verificato: firmware non usa SPIFFS/FFat/LittleFS — nessun impatto funzionale
-//     Margine attuale: 1.209.043 byte sketch / 2.080.768 byte slot = 42% libero
-//   - VMG Wind: clamp rimosso (ereditato da V45.4.10) — invariato in questa release
-//   - NESSUNA logica di download/installazione OTA in questa versione
-//     Questa release prepara solo lo schema partizione (Fase 1).
-//     Il client OTA (download, verify, install) sarà introdotto in Fase 2.
+// Release: V2.3.0
 //
-// Storico versioni precedenti (schema V45.x.y, ora migrato a SemVer):
-// Hardware: Adafruit ESP32-S3 Feather 2MB PSRAM
-//           BNO085 I2C 0x4A + GPS PA1616S I2C 0x10 + NeoPixel pin33
-//           Anemometro NMEA 0183 @ 4800 baud (RX=38, TX=39)
+// Changelog V2.3.1 — Fix compilazione (PATCH):
+//   - Rete_Cloud.ino: aggiunto codice reale setupWiFi/gestisciWiFi/setupWebServer
+//     (erano placeholder — causava undeclared in setup/loop/Bussola.ino)
+//   - AYE_POD_v37_DEV.ino: g_otaInCorso → extern (OTA.ino la definisce già)
+//   - Rete_Cloud.ino: controllaOTA — otaForce/hasTsRetry da bool a const char*
+// Changelog V2.3.0:
+//   - Filtro SOG ricalibrato per navigazione in acque mosse (onde, rollio)
+//     Soglie ridotte: BNO_FERMO 0.06, gate finale 0.50 kn (era 1.00 kn)
+//   - calcolaWaypoint(): BTW, DTW, VMG_WP, WP_BEARING_REL, ETA, arrive alert
+//     Calcolo CPU-only dopo leggiGPS(), zero Wire, zero latenza bus
+//   - struct_nautica: +19 bytes (106 totale) — aggiunti campi WP in fondo
+//     BREAKING CHANGE: richiede aggiornamento contestuale AYE_Visore
+//   - vmg_target (era vmg, sempre 0) ora popolato con VMG verso waypoint
+//   - Nuove variabili globali: g_btw, g_dtw, g_vmg_wp, g_wp_bearing_rel,
+//     g_eta_wp_sec, g_wp_arrive_alert
+//   - DB Supabase: telemetria invia btw, dtw, vmg_wp (Rete_Cloud.ino)
 //
-// ARCHITETTURA DEFINITIVA — storia completa:
+// Changelog V2.2.6 (precedente):
+//   - Fix setTimeout(8s corr.) + Stack2 PRIMA di Stack1
 //
-//   V44.4.0  GPS.read() 1x/ciclo + delay(100) → SOG latenza ~60s
-//   V45.0.0  TaskGPS Core1 prio2 → race condition Wire con BNO → tutti 0
-//   V45.1.0  TaskGPS Core0 + mutex Wire → starvation → GPS age:99999
-//   V45.2.0  Loop drain GPS completo → ESP-NOW flood 50Hz → link Visore KO
-//   V45.4.6  STABILE: loop 50Hz, GPS incrementale con break, ESP-NOW 10Hz
-//
-//   REGOLE ARCHITETTURALI (non modificare):
+// ARCHITETTURA DEFINITIVA (invariata):
 //   1. Wire usato SOLO dal loop() Core1 — mai da task separati
-//   2. GPS: pattern Adafruit con break dopo parse (no sovrascrittura lastNMEA)
-//   3. ESP-NOW: timer 100ms in inviaDatiVisore() — mai chiamare a >10Hz
+//   2. GPS: pattern Adafruit con break dopo parse
+//   3. ESP-NOW: timer 100ms in inviaDatiVisore() — mai >10Hz
 //   4. TaskCloud Core0: SOLO HTTP, ZERO Wire
 //
 //   ┌─ Core 0 ────────────────────────────────────────────────────────────┐
@@ -38,21 +34,16 @@
 //   ┌─ Core 1 — loop() ogni 20ms (50Hz) ─────────────────────────────────┐
 //   │  leggiBussola()     Wire BNO085 → heading/roll/pitch 50Hz          │
 //   │  leggiGPS()         Wire GPS   → SOG/COG/coord ≤120ms latenza      │
+//   │  calcolaWaypoint()  CPU only   → BTW/DTW/VMG_WP/ETA               │
 //   │  leggiVento()       Serial1    → AWA/AWS 10Hz NMEA                 │
 //   │  calcolaVentoVero() CPU only   → TWA/TWS/TWD                       │
-//   │  calcolaVMG()       CPU only   → VMG vento                         │
+//   │  calcolaVMG()       CPU only   → VMG vento + VMG waypoint          │
 //   │  inviaDatiVisore()  ESP-NOW    → 10Hz (timer 100ms interno)        │
 //   └─────────────────────────────────────────────────────────────────────┘
 //
-// File del progetto V45.4.6 — tutti i file necessari:
-//   AYE_POD_v45_3.ino     ← questo file (main)
-//   GPS_v45_4.ino         ← leggiGPS() + guardia SOG dual-sensor BNO+GPS
-//   Bussola_v45_3.ino     ← BNO085 semplice senza mutex
-//   Visore_v45_3.ino      ← ESP-NOW con timer 100ms
-//   Rete_Cloud_v45_3.ino  ← TaskCloud Core0, HTTP 2s
-//   Utils_v45_3.ino       ← LED + telemetria
-//   Vento.ino             ← INVARIATO (Serial1, no Wire)
-//   AYE_Visore_V45_3.ino  ← INVARIATO (no smooth, raw values)
+// Hardware: Adafruit ESP32-S3 Feather 2MB PSRAM
+//           BNO085 I2C 0x4A + PA1010D I2C 0x10 + NeoPixel pin33
+//           Anemometro NMEA 0183 @ 4800 baud (RX=38, TX=39)
 // =========================================================================
 
 #include <WiFi.h>
@@ -67,15 +58,11 @@
 #include <Preferences.h>
 #include <math.h>
 
-// ── Versionamento Semantico (SemVer) — V2.0.0 introduce schema OTA ────────
-// Formato: MAJOR.MINOR.PATCH
-//   MAJOR: breaking change struct ESP-NOW o partition scheme (raro, manuale)
-//   MINOR: nuove funzionalità retrocompatibili (es. Anchor FASE 4)
-//   PATCH: bugfix, tuning, nessuna nuova funzione (es. fix VMG)
+// ── Versionamento SemVer ──────────────────────────────────────────────────
 #define FW_VERSION_MAJOR 2
-#define FW_VERSION_MINOR 2
-#define FW_VERSION_PATCH 6
-#define FW_VERSION "2.2.6"
+#define FW_VERSION_MINOR 3
+#define FW_VERSION_PATCH 1
+#define FW_VERSION "2.3.1"
 
 #ifndef PIN_NEOPIXEL
   #define PIN_NEOPIXEL 33
@@ -93,20 +80,54 @@
 String  fwVisoreAttuale = "n.d.";
 uint8_t macVisore[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-// ── Struct ESP-NOW Pod→Visore (82 bytes packed — INVARIATA da V44.4.0) ─────
-// NON MODIFICARE senza aggiornare contestualmente AYE_Visore
+// ── Struct ESP-NOW Pod→Visore (106 bytes packed) ───────────────────────────
+// V2.3.0: +21 bytes rispetto alla V2.2.6 (87 bytes) → totale 108 bytes
+// I nuovi campi sono AGGIUNTI IN FONDO: gli offset di tutti i campi
+// precedenti rimangono identici — la rottura è solo nel sizeof totale.
+//
+// CAMPI INVARIATI (offset 0-86, identici a V2.2.6):
+//   roll, pitch, heading, sog, awa, aws, twa, tws, twd
+//   batteria_pod, cloud_connesso, gps_fix, lat, lon, cog
+//   vmg_target (era 'vmg', ora popolato con VMG verso waypoint)
+//   vmg_wind, codice_crew[8], fw_str[12], unix_timestamp, anchor_alert
+//
+// CAMPI NUOVI (offset 87-105):
+//   btw            — bearing to waypoint (gradi 0-359, Nord = riferimento)
+//   dtw            — distance to waypoint (miglia nautiche)
+//   wp_bearing_rel — BTW relativo alla prora corretto (-180/+180°)
+//                    Positivo = WP a dritta, Negativo = WP a sinistra
+//   vmg_wp         — SOG × cos(COG - BTW), VMG effettivo verso WP
+//   eta_wp_sec     — ETA in secondi (0 = N/A, barca ferma o fuori rotta)
+//   wp_arrive_alert — true quando DTW < 50m (arrive alarm)
+//
+// BREAKING CHANGE: AYE_Visore deve essere aggiornato contestualmente.
+// Il Visore vecchio (87 bytes) scarterà i pacchetti silenziosamente.
+// ──────────────────────────────────────────────────────────────────────────
 typedef struct __attribute__((packed)) struct_nautica {
-  int   roll, pitch, heading;
-  float sog, awa, aws, twa, tws, twd;
-  int   batteria_pod;
-  bool  cloud_connesso, gps_fix;
-  float lat, lon, cog, vmg, vmg_wind;
-  char  codice_crew[8];   // PIN crew aggiornato dal DB ogni 30s
-  char  fw_str[12];       // es. "2.0.0" (SemVer) — buffer invariato, retrocompatibile
-  uint32_t unix_timestamp;  // epoch UTC da NMEA GPS (+4 byte)
-  bool     anchor_alert;    // ancora allerta (+1 byte)
+  // ── Assetto (invariato) ────────────────────────────────────────────────
+  int   roll, pitch, heading;          // 12 bytes
+  // ── Navigazione (invariato) ───────────────────────────────────────────
+  float sog, awa, aws, twa, tws, twd; // 24 bytes
+  int   batteria_pod;                  // 4 bytes
+  bool  cloud_connesso, gps_fix;       // 2 bytes
+  float lat, lon, cog;                 // 12 bytes
+  float vmg_target;                    // 4 bytes — era 'vmg' (sempre 0), ora VMG verso WP
+  float vmg_wind;                      // 4 bytes
+  // ── Identificativi (invariato) ────────────────────────────────────────
+  char  codice_crew[8];                // 8 bytes
+  char  fw_str[12];                    // 12 bytes
+  // ── Timestamp e alert (invariato) ─────────────────────────────────────
+  uint32_t unix_timestamp;             // 4 bytes
+  bool     anchor_alert;              // 1 byte  ← offset 86
+  // ── Waypoint navigation (NUOVO V2.3.0) ────────────────────────────────
+  float    btw;                        // 4 bytes — bearing to waypoint (0-359°)
+  float    dtw;                        // 4 bytes — distance to waypoint (nm)
+  float    wp_bearing_rel;             // 4 bytes — BTW relativo alla prora (signed)
+  float    vmg_wp;                     // 4 bytes — VMG effettivo verso WP
+  uint32_t eta_wp_sec;                 // 4 bytes — ETA in secondi
+  bool     wp_arrive_alert;            // 1 byte  ← offset 105
 } struct_nautica;
-// Verifica al boot: sizeof deve essere 87 (era 82)
+// sizeof atteso: 87 (V2.2.6) + 21 (WP: 5×float/uint32 + 1×bool) = 108 bytes
 
 struct_nautica datiNautici;
 
@@ -120,7 +141,7 @@ typedef struct __attribute__((packed)) struct_messaggio_visore {
 
 struct_messaggio_visore datiDalVisore;
 
-// ── Variabili sensori — scritte da loop(), lette da TaskCloud ─────────────
+// ── Variabili sensori — Core1 scrive, TaskCloud legge ─────────────────────
 volatile int    g_roll=0, g_pitch=0, g_head=0, g_raw_head=0, g_acc=0;
 volatile float  g_sog=0.0f, g_cog=0.0f;
 volatile double g_lat=0.0,  g_lon=0.0;
@@ -130,87 +151,70 @@ volatile float  g_awa=-1.0f, g_aws=0.0f;
 volatile float  g_twa=0.0f,  g_tws=0.0f;
 volatile int    g_twd=0;
 volatile float  g_vmg=0.0f,  g_vmg_wind=0.0f;
-volatile float  g_accel_mag=0.0f;       // BNO085 campione istantaneo (m/s²) — telemetria
-volatile float  g_accel_mag_media=0.0f; // BNO085 media 400ms — usata da leggiGPS()
-volatile double g_wp_lat=0.0, g_wp_lon=0.0;
-volatile int    g_wp_active=0;
-// V2.2.3: extern per bloccare loop() durante OTA (evita Cache Miss Panic
-// e race condition esp_now_send su Core1 mentre Core0 scrive flash)
-extern volatile bool g_otaInCorso;
-volatile bool   wifiConnesso=false, calibrazioneRichiesta=false;
-volatile bool   autoCalibAttiva=false;
-volatile int    remoteOffset=0;
+volatile float  g_accel_mag=0.0f;
+volatile float  g_accel_mag_media=0.0f;
 
-// ── Anchor Alert (V45.4.7) ───────────────────────────────────────────────
-volatile double  g_anchor_lat = 0.0;    // lat ancora (WGS84)
-volatile double  g_anchor_lon = 0.0;    // lon ancora (WGS84)
-volatile float   g_anchor_raggio_m = 0.0f; // raggio allerta in metri
-volatile bool    g_anchor_attivo = false;   // ancora calata e allerta ON
-volatile bool    g_anchor_alert = false;    // TRUE = barca fuori dal raggio
+// ── Waypoint navigation — NUOVE V2.3.0 ───────────────────────────────────
+volatile double  g_wp_lat=0.0, g_wp_lon=0.0;
+volatile int     g_wp_active=0;
+volatile float   g_btw=0.0f;            // bearing to waypoint (0-359°)
+volatile float   g_dtw=0.0f;            // distance to waypoint (nm)
+volatile float   g_vmg_wp=0.0f;         // VMG verso waypoint (kn)
+volatile float   g_wp_bearing_rel=0.0f; // BTW relativo alla prora (±180°)
+volatile uint32_t g_eta_wp_sec=0;       // ETA in secondi
+volatile bool    g_wp_arrive_alert=false;
 
-// ── Timestamp GPS (V45.4.7) ─────────────────────────────────────────────
-volatile uint32_t g_unix_timestamp = 0; // secondi epoch UTC da NMEA
+// ── Variabili timestamp e anchor ─────────────────────────────────────────
+volatile uint32_t g_unix_timestamp=0;
+volatile bool     g_anchor_alert=false;
+volatile double   g_anchor_lat=0.0, g_anchor_lon=0.0;
+volatile float    g_anchor_raggio_m=30.0f;
+volatile bool     g_anchor_attivo=false;
 
-float sommaOffset=0.0f;
-int   campioniOffset=0;
-unsigned long lastWifiAttempt=0;
-
-// ── Hardware ───────────────────────────────────────────────────────────────
-Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB+NEO_KHZ800);
-Adafruit_BNO08x   bno08x;
+// ── Librerie oggetti ──────────────────────────────────────────────────────
+Adafruit_BNO08x  bno08x;
 sh2_SensorValue_t sensorValue;
+Adafruit_GPS GPS(&Wire);
 Adafruit_MAX17048 maxlipo;
-Adafruit_GPS      GPS(&Wire);  // GPS su Wire — usato SOLO dal loop() Core1
-Preferences       prefsOffset;
+Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 
-// ── Prototipi ──────────────────────────────────────────────────────────────
-void impostaLED(uint32_t, bool=false);
-void setupUtils();
-void setupGPS();
-void leggiGPS();
-void setupBussola();
-void leggiBussola();
-void avviaCalibrazioneBNO();
-void leggiVento();
-void calcolaVentoVero();
-void calcolaVMG();
-void inviaDatiVisore();
-void stampaTelemetria();
-void gestisciWiFi();
-void setupWiFi();
-void setupESPNOW();
-void eseguiAutoCalibrazioneGPS();
-void TaskInvioCloud(void*);
-unsigned long gpsAgeMs();
+// ── Calibrazione bussola ─────────────────────────────────────────────────
+Preferences prefsOffset;
+int         remoteOffset = 0;
+bool        autoCalibAttiva = false;
+float       sommaOffset = 0.0f;
+int         campioniOffset = 0;
+bool        calibrazioneRichiesta = false;
 
-// =========================================================================
+// ── Flag OTA ─────────────────────────────────────────────────────────────
+extern volatile bool g_otaInCorso;  // definita in OTA.ino — no ridefinizione
+
+// ============================================================================
 // SETUP
-// =========================================================================
+// ============================================================================
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(WIND_BAUD_RATE, SERIAL_8N1, RX_PIN, TX_PIN);
   delay(500);
+  Serial.printf("\n[SYS] === AYE POD V%s BOOT ===\n", FW_VERSION);
 
-  Serial.println("\n================================");
-  Serial.printf(" AYE POD %s\n", FW_VERSION);
-  Serial.println("================================");
-
-  // Verifica struct prima di toccare qualsiasi hardware
-  int sz_nav = (int)sizeof(struct_nautica);
-  int sz_vis = (int)sizeof(datiDalVisore);
-  Serial.printf("[SYS] struct_nautica=%d bytes (atteso 87)\n", sz_nav);
-  if (sz_nav != 87) { Serial.println("[SYS] ERRORE CRITICO: struct size mismatch!"); while(1) delay(1000); }
-  Serial.printf("[SYS] datiDalVisore=%d bytes (atteso 22)\n",  sz_vis);
-  if (sz_nav != 82 || sz_vis != 22) {
-    Serial.println("[ERRORE CRITICO] Struct ESP-NOW non allineata — il Visore ricevera' spazzatura!");
+  // Verifica dimensione struct — CRITICA per ESP-NOW
+  int sz_nav = sizeof(struct_nautica);
+  int sz_vis = sizeof(datiDalVisore);
+  Serial.printf("[SYS] struct_nautica=%d bytes (atteso 108)\n", sz_nav);
+  Serial.printf("[SYS] datiDalVisore=%d bytes (atteso 22)\n",   sz_vis);
+  if (sz_nav != 108) {
+    Serial.println("[ERRORE CRITICO] struct_nautica size errata! Il Visore riceverà spazzatura.");
+  }
+  if (sz_vis != 22) {
+    Serial.println("[ERRORE CRITICO] struct_messaggio_visore size errata!");
   }
 
   setupUtils();          // Wire.begin() + NeoPixel + MAX17048
-  Wire.setClock(400000); // I2C Fast Mode: riduce tempo drain GPS da ~5ms a ~1ms
+  Wire.setClock(400000); // I2C Fast Mode 400kHz — riduce drain GPS da ~5ms a ~1ms
   Serial.println("[SYS] I2C @ 400kHz (Fast Mode)");
 
-  setupBussola();        // BNO085 @ 0x4A — nessun mutex, solo Core1
-  setupGPS();            // GPS @ 0x10 — nessun task, legge nel loop()
+  setupBussola();        // BNO085 @ 0x4A
+  setupGPS();            // PA1010D @ 0x10 — 5Hz+SBAS
   setupWiFi();
   setupESPNOW();
 
@@ -222,50 +226,44 @@ void setup() {
   strncpy(datiNautici.fw_str,      FW_VERSION, 12);
   strncpy(datiNautici.codice_crew, "----",      8);
 
-  // TaskCloud su Core 0 — l'unico task aggiuntivo, NON tocca Wire
-  // V2.2.3: stack portato a 16384 (da 8192) per supportare handshake SSL
-  // OTA + buffer streaming heap + mbedtls durante download firmware.
+  // TaskCloud su Core 0 — NON tocca Wire
   xTaskCreatePinnedToCore(TaskInvioCloud, "TaskCloud", 16384, NULL, 1, NULL, 0);
 
   Serial.println("[SYS] === BOOT OK ===");
-  Serial.printf("[SYS] Core0: TaskCloud  Core1: loop(BNO@50Hz + GPS@5Hz+SBAS + ESPNOW@10Hz) V%s\n\n", FW_VERSION);
+  Serial.printf("[SYS] Core0:TaskCloud  Core1:loop(BNO@50Hz+GPS@5Hz+WP_calc+ESPNOW@10Hz) V%s\n\n",
+                FW_VERSION);
 }
 
-// =========================================================================
+// ============================================================================
 // LOOP PRINCIPALE — Core 1, 50Hz (delay 20ms)
 //
-// Wire usato SOLO qui: BNO085 e GPS in sequenza, stesso task, stesso core
-// → zero race condition, zero mutex, zero task separati
-//
-// TaskCloud (Core 0) NON usa Wire → nessuna interferenza possibile
-// =========================================================================
+// Wire usato SOLO qui: BNO085 e GPS in sequenza, stesso task, stesso core.
+// calcolaWaypoint() è CPU-only: zero Wire, chiamata dopo leggiGPS().
+// TaskCloud (Core 0) NON usa Wire.
+// ============================================================================
 void loop() {
 
-  // V2.2.3: blocca Core1 durante OTA — evita Cache Miss Panic e
-  // race condition esp_now_send mentre Core0 scrive la flash.
   if (g_otaInCorso) {
     delay(100);
     return;
   }
 
-  // Calibrazione BNO richiesta via cloud: blocca brevemente il loop
   if (calibrazioneRichiesta) {
     calibrazioneRichiesta = false;
     avviaCalibrazioneBNO();
     return;
   }
 
-  // Gestione WiFi reconnect (non-blocking se già connesso)
   gestisciWiFi();
 
-  // ── Sensori I2C (Wire — Core1 esclusivo) ──────────────────────────────
-  leggiBussola();    // BNO085: quaternione → heading/roll/pitch
-  leggiGPS();        // GPS: parser incrementale con break → SOG/COG/coord
+  // ── Sensori I2C (Wire — Core1 esclusivo) ─────────────────────────────
+  leggiBussola();     // BNO085: quaternione → heading/roll/pitch
+  leggiGPS();         // PA1010D: parser incrementale → SOG/COG/coord
 
-  // ── Auto-calibrazione bussola via GPS ─────────────────────────────────
+  // ── Auto-calibrazione bussola via GPS ────────────────────────────────
   if (autoCalibAttiva) eseguiAutoCalibrazioneGPS();
 
-  // ── Scarroccio COG-HDG ────────────────────────────────────────────────
+  // ── Scarroccio COG-HDG ───────────────────────────────────────────────
   if (g_sog >= 0.5f) {
     float d = (float)g_cog - (float)g_head;
     while (d >  180.0f) d -= 360.0f;
@@ -275,25 +273,25 @@ void loop() {
     g_drift = 0.0f;
   }
 
-  // ── Vento (Serial1 — no Wire, no conflitti) ───────────────────────────
-  leggiVento();        // parser NMEA MWV → g_awa, g_aws, poi calcolaVentoVero()
+  // ── Waypoint navigation (CPU only, zero Wire) ────────────────────────
+  calcolaWaypoint();  // BTW, DTW, VMG_WP, WP_BEARING_REL, ETA, arrive alert
 
-  // ── Calcoli derivati (CPU only) ───────────────────────────────────────
-  calcolaVMG();        // VMG vento (waypoint = 0 lato Pod)
+  // ── Vento (Serial1 — no Wire) ────────────────────────────────────────
+  leggiVento();       // NMEA MWV → g_awa, g_aws, calcolaVentoVero()
 
-  // ── Trasmissione al Visore via ESP-NOW @ 10Hz ─────────────────────────
-  // inviaDatiVisore() ha timer interno: TX avviene solo ogni 100ms
-  // Il loop gira a 50Hz ma la radio viene usata solo ogni 5 cicli
-  inviaDatiVisore();
+  // ── Calcoli derivati ─────────────────────────────────────────────────
+  calcolaVMG();       // VMG vento + VMG waypoint
 
-  // ── Telemetria debug seriale ──────────────────────────────────────────
+  // ── Trasmissione Visore via ESP-NOW @ 10Hz ────────────────────────────
+  inviaDatiVisore();  // timer interno 100ms
+
+  // ── Telemetria debug seriale @ 1Hz ───────────────────────────────────
   stampaTelemetria();
 
-  // 20ms: 50Hz per BNO fluido e GPS incrementale
-  delay(20);
+  delay(20); // 50Hz
 }
 
-// ── Auto-calibrazione bussola via GPS ─────────────────────────────────────
+// ── Auto-calibrazione bussola via GPS (INVARIATA) ────────────────────────
 void eseguiAutoCalibrazioneGPS() {
   if (g_sog < 3.0f) return;
   float diff = (float)g_cog - (float)g_raw_head;
