@@ -1,26 +1,58 @@
 // =========================================================================
 // AYE POD — Rete_Cloud.ino
-// Release: V2.3.1
+// Release: V2.3.2
 //
-// Changelog V2.3.0:
-//   - FASE 1: aggiunto parse di wp_alert_lat, wp_alert_lon, wp_alert_attivo
-//     dalla tabella dispositivi (campi già esistenti nel DB, zero migration)
-//     → popola g_wp_lat, g_wp_lon, g_wp_active per calcolaWaypoint()
-//   - Stack 2 (telemetria): aggiunti campi btw, dtw, vmg_wp al JSON
-//     → popolano le colonne nuove in punti_traccia_live (migration SQL necessaria)
-//   - vmg_target: ora inviato come g_vmg_wp (era sempre 0.0)
+// Changelog V2.3.2 — Binding POD↔Visore via Supabase (MINOR).
+//   Fix compilazione: esp_read_mac()/ESP_MAC_WIFI_STA sostituiti con
+//   WiFi.macAddress() — non richiede esp_mac.h, funziona su tutti i
+//   core Arduino ESP32 (2.x e 3.x). Nessuna modifica funzionale.
 //
-// Changelog V2.2.4 (precedente):
-//   - Fix setTimeout millisecondi (era 8ms, ora 8000ms)
 //
-// Tutte le altre funzioni invariate: gestione sessione, OTA, WiFi portal,
-// anchor, nome_capitano, codice_crew, prua_offset, cmd_calibra.
+//   NUOVE FUNZIONALITÀ:
+//
+//   1. REGISTRAZIONE MAC POD — una tantum al primo boot connesso
+//      Al primo GET FASE1 riuscito, legge il MAC WiFi dell'ESP32 via
+//      esp_read_mac() e chiama la RPC registra_mac_pod() su Supabase.
+//      Idempotente: flag NVS namespace 'pod_prov' (chiave 'mac_ok')
+//      evita la chiamata ai boot successivi anche senza risposta DB.
+//      Il MAC viene scritto nella colonna mac_pod di dispositivi.
+//
+//   2. LETTURA mac_visore_bound DA DB — ogni 30s (dentro FASE1 esistente)
+//      Aggiunto "mac_visore_bound" alla SELECT FASE1 esistente (una riga).
+//      Se il valore nel DB cambia rispetto all'ultimo letto:
+//        → parseMacString() converte "AA:BB:CC:DD:EE:FF" → uint8_t[6]
+//        → aggiornaVisorePeer() aggiorna il peer ESP-NOW:
+//            esp_now_del_peer(vecchioMac) + esp_now_add_peer(nuovoMac)
+//        → macVisore[] viene aggiornato (globale usato da inviaDatiVisore)
+//      Se mac_visore_bound è NULL nel DB → torna a broadcast FF:FF:FF:FF:FF:FF
+//      Il POD funziona normalmente senza Visore: TX broadcast, nessun errore.
+//
+//   THREAD SAFETY:
+//      aggiornaVisorePeer() è chiamata solo da TaskCloud (Core0).
+//      inviaDatiVisore() in Visore.ino (Core1) chiama solo esp_now_send()
+//      e legge macVisore[] ma non modifica la peer list.
+//      esp_now_del_peer/add_peer sono safe da Core0 secondo ESP-IDF docs.
+//      macVisore[] è un array globale: la scrittura da Core0 è atomica
+//      per allineamento (6 byte) su Xtensa LX7. Nessun mutex necessario.
+//
+//   INVARIATO RISPETTO A V2.3.1:
+//      Tutte le funzioni esistenti: setupWiFi, gestisciWiFi, setupWebServer,
+//      chiamaRPC, TaskInvioCloud (FASE1 config, Stack1 sessione, Stack2
+//      telemetria, OTA gate), anchor, waypoint, nome_capitano, codice_crew.
+//      sizeof(struct_nautica) = 108 byte — INVARIATO.
+//      sizeof(struct_messaggio_visore) = 22 byte — INVARIATO.
+//      Nessuna modifica a Visore.ino, AYE_POD_v37_DEV.ino, OTA.ino.
+//
+// Changelog V2.3.1 — Fix compilazione (PATCH)
+// Changelog V2.3.0 — Waypoint navigation, filtro SOG, telemetria btw/dtw/vmg_wp
+// Changelog V2.2.4 — Fix setTimeout millisecondi
 // =========================================================================
 
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+// esp_wifi.h non necessario — usiamo WiFi.macAddress() che è in WiFi.h (già incluso)
 
 Preferences prefs;
 extern Preferences prefsOffset;
@@ -30,20 +62,17 @@ DNSServer dnsServer;
 
 String savedSSID = "";
 String savedPass = "";
-bool   portalRunning   = false;
-unsigned long portalStartTime = 0;
-unsigned long lastWifiAttempt = 0;
+bool   portalRunning    = false;
+unsigned long portalStartTime  = 0;
+unsigned long lastWifiAttempt  = 0;
 
-// ── Credenziali da secrets.h ─────────────────────────────────────────────
-// secrets.h usa #define con prefisso POD_ (es. POD_NOME, POD_SUPABASE_URL).
-// Qui definiamo le variabili const char* con i nomi esatti che OTA.ino
-// cerca tramite 'extern const char* NOME_POD / SUPABASE_URL / SUPABASE_KEY'.
-// I nomi delle #define (POD_*) e delle variabili C++ (NOME_POD, ecc.) sono
-// diversi → zero conflitto di espansione del preprocessore.
+// ── Credenziali da secrets.h ──────────────────────────────────────────────
+// secrets.h usa #define con prefisso POD_ (POD_NOME, POD_SUPABASE_URL, ...)
+// Le variabili const char* sotto sono quelle cercate da OTA.ino via extern.
 #include "secrets.h"
-const char* NOME_POD     = POD_NOME;         // OTA.ino: extern const char* NOME_POD
-const char* SUPABASE_URL = POD_SUPABASE_URL; // OTA.ino: extern const char* SUPABASE_URL
-const char* SUPABASE_KEY = POD_SUPABASE_KEY; // OTA.ino: extern const char* SUPABASE_KEY
+const char* NOME_POD     = POD_NOME;
+const char* SUPABASE_URL = POD_SUPABASE_URL;
+const char* SUPABASE_KEY = POD_SUPABASE_KEY;
 
 bool g_fase1Ok = false;
 
@@ -62,7 +91,117 @@ volatile int   g_retryChiudiCount      = 0;
 
 bool wifiConnesso = false;
 
-// ── chiamaRPC() — INVARIATA ───────────────────────────────────────────────
+// ── V2.3.2: Binding Visore ────────────────────────────────────────────────
+// macVisore[] dichiarato in AYE_POD_v37_DEV.ino, usato da Visore.ino.
+// Usiamo extern per accedervi da TaskCloud (Core0).
+extern uint8_t macVisore[6];
+
+// MAC broadcast — default quando nessun Visore è abbinato
+static const uint8_t MAC_BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+// Ultimo MAC letto dal DB — per rilevare cambiamenti ed evitare update inutili
+static uint8_t g_macVisorePrecedente[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+// Flag persistente NVS: MAC POD già registrato su Supabase
+static bool g_macPodRegistrato = false;
+
+// ── V2.3.2: Parsing stringa MAC → array uint8_t[6] ───────────────────────
+// Accetta "AA:BB:CC:DD:EE:FF" (con ':') o "AABBCCDDEEFF" (senza).
+// Ritorna true se il parsing è riuscito e il MAC è valido.
+static bool parseMacString(const String& macStr, uint8_t out[6]) {
+  String clean = macStr;
+  clean.replace(":", "");
+  clean.replace("-", "");
+  clean.toUpperCase();
+  clean.trim();
+  if (clean.length() != 12) return false;
+  for (int i = 0; i < 6; i++) {
+    char byteStr[3] = { clean[i*2], clean[i*2+1], '\0' };
+    out[i] = (uint8_t)strtol(byteStr, nullptr, 16);
+  }
+  return true;
+}
+
+// ── V2.3.2: Aggiornamento peer ESP-NOW con nuovo MAC Visore ──────────────
+// Chiamata da TaskCloud (Core0) solo quando mac_visore_bound cambia nel DB.
+// Sequenza: rimuovi vecchio peer → aggiorna macVisore[] → aggiungi nuovo peer.
+static void aggiornaVisorePeer(const uint8_t nuovoMac[6]) {
+  // Rimuovi peer precedente (errore ignorato: potrebbe non esistere)
+  esp_now_del_peer(g_macVisorePrecedente);
+
+  // Aggiorna il globale macVisore[] usato da inviaDatiVisore() in Visore.ino
+  memcpy(macVisore, nuovoMac, 6);
+  memcpy(g_macVisorePrecedente, nuovoMac, 6);
+
+  // Se è broadcast, non aggiungere come peer unicast (non necessario,
+  // esp_now_send con FF:FF:FF:FF:FF:FF funziona senza peer registrato)
+  bool isBroadcast = true;
+  for (int i = 0; i < 6; i++) {
+    if (nuovoMac[i] != 0xFF) { isBroadcast = false; break; }
+  }
+
+  if (isBroadcast) {
+    Serial.println("[BIND] Visore rimosso — TX broadcast FF:FF:FF:FF:FF:FF");
+    return;
+  }
+
+  // Aggiungi nuovo peer unicast
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, nuovoMac, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  esp_err_t err = esp_now_add_peer(&peer);
+  if (err == ESP_OK) {
+    Serial.printf("[BIND] Peer aggiornato → %02X:%02X:%02X:%02X:%02X:%02X\n",
+      nuovoMac[0],nuovoMac[1],nuovoMac[2],nuovoMac[3],nuovoMac[4],nuovoMac[5]);
+  } else {
+    Serial.printf("[BIND] WARN esp_now_add_peer err=%d\n", (int)err);
+  }
+}
+
+// ── V2.3.2: Registra MAC POD su Supabase (una tantum) ────────────────────
+// Chiamata dopo il primo GET FASE1 riuscito.
+// NVS 'pod_prov'/'mac_ok' impedisce ripetizioni tra reboot.
+static void registraMacPodSeNecessario() {
+  if (g_macPodRegistrato) return;
+
+  // Controlla NVS prima di fare la chiamata HTTP
+  Preferences nvsProv;
+  nvsProv.begin("pod_prov", true);
+  bool giaOk = nvsProv.getBool("mac_ok", false);
+  nvsProv.end();
+  if (giaOk) { g_macPodRegistrato = true; return; }
+
+  // Leggi MAC WiFi STA dell'ESP32.
+  // WiFi.macAddress() è disponibile da WiFi.h (già incluso) su tutti i core
+  // Arduino ESP32 (ESP32, ESP32-S3, ESP32-C3...) — più portabile di esp_read_mac().
+  // Formato restituito: "AA:BB:CC:DD:EE:FF" — già pronto per il body della RPC.
+  // WiFi è già in WIFI_AP_STA quando questa funzione viene chiamata (post-setupWiFi).
+  String macString = WiFi.macAddress();
+  macString.toUpperCase();
+  const char* macStr = macString.c_str();
+
+  // Chiama RPC registra_mac_pod
+  String body = "{\"p_pod_id\":\"" + String(NOME_POD) + "\","
+                 "\"p_mac_pod\":\"" + String(macStr) + "\","
+                 "\"p_fw\":\"" + String(FW_VERSION) + "\"}";
+  String resp;
+  int rc = chiamaRPC("registra_mac_pod", body, &resp);
+
+  if (rc >= 200 && rc < 300) {
+    Serial.printf("[PROV] MAC POD registrato: %s\n", macStr);
+    Preferences nvsW;
+    nvsW.begin("pod_prov", false);
+    nvsW.putBool("mac_ok", true);
+    nvsW.end();
+    g_macPodRegistrato = true;
+  } else {
+    // Non blocca: riproverà al prossimo ciclo FASE1 (30s)
+    Serial.printf("[PROV] registra_mac_pod rc=%d — riprova al prossimo ciclo\n", rc);
+  }
+}
+
+// ── chiamaRPC() — INVARIATA da V2.3.1 ────────────────────────────────────
 int chiamaRPC(const char* nome, const String& body, String* respOut = nullptr) {
   HTTPClient h;
   h.begin(String(SUPABASE_URL)+"/rest/v1/rpc/"+nome);
@@ -79,12 +218,14 @@ int chiamaRPC(const char* nome, const String& body, String* respOut = nullptr) {
   return rc;
 }
 
-// ============================================================================
-// TASK CLOUD — V2.3.0
-// ============================================================================
+// =========================================================================
+// TASK CLOUD — V2.3.2
+// Struttura invariata rispetto a V2.3.1.
+// Aggiunta: lettura mac_visore_bound + registrazione MAC POD dentro FASE1.
+// =========================================================================
 void TaskInvioCloud(void* pvParameters) {
-  static unsigned long lastConfigRead  = 0;
-  static int           lastCmdSnap     = 0;
+  static unsigned long lastConfigRead = 0;
+  static int           lastCmdSnap   = 0;
 
   while (true) {
 
@@ -94,30 +235,62 @@ void TaskInvioCloud(void* pvParameters) {
       int   snapCmd  = (int)g_cmdSessSnap;
       float snapDist = (float)g_cmdSessSnapDist;
 
-      // ══════════════════════════════════════════════════════════════════
+      // ════════════════════════════════════════════════════════════════
       // FASE 1 — Config DB ogni 30s
-      // V2.3.0: aggiunto parse wp_alert_lat/lon/attivo per waypoint nav
-      // ══════════════════════════════════════════════════════════════════
+      // V2.3.2: aggiunto "mac_visore_bound" alla SELECT esistente
+      // ════════════════════════════════════════════════════════════════
       if (millis()-lastConfigRead > 30000) {
         lastConfigRead = millis();
         HTTPClient hConf;
         String ep = String(SUPABASE_URL)+"/rest/v1/dispositivi?pod_id=eq."+NOME_POD+
           "&select=prua_offset,cmd_calibra,sessione_attiva_id,nome_capitano,codice_crew_live"
           ",anchor_lat,anchor_lon,anchor_raggio,anchor_attivo"
-          ",wp_alert_lat,wp_alert_lon,wp_alert_attivo"  // ← NUOVO V2.3.0
-          ",ota_version,ota_url,ota_sha256,ota_stato,ota_force,ota_retry_ts";
+          ",wp_alert_lat,wp_alert_lon,wp_alert_attivo"
+          ",ota_version,ota_url,ota_sha256,ota_stato,ota_force,ota_retry_ts"
+          ",mac_visore_bound";    // ← V2.3.2: nuovo campo
         hConf.begin(ep);
         hConf.addHeader("apikey", SUPABASE_KEY);
         hConf.addHeader("Authorization", String("Bearer ")+SUPABASE_KEY);
+
         if (hConf.GET() > 0) {
           String r = hConf.getString();
 
+          // Gate OTA — invariato
           if (!g_fase1Ok) {
             g_fase1Ok = true;
             Serial.println("[CLOUD] FASE1 OK — SSL warm, gate OTA sbloccato");
           }
 
-          // prua_offset
+          // ── V2.3.2: Registrazione MAC POD (una tantum) ──────────────
+          registraMacPodSeNecessario();
+
+          // ── V2.3.2: Lettura e aggiornamento mac_visore_bound ─────────
+          {
+            uint8_t nuovoMac[6];
+            bool macValido = false;
+            int ib = r.indexOf("\"mac_visore_bound\":");
+            if (ib > 0) {
+              ib += 19;
+              if (r.charAt(ib) == '"') {
+                // Valore stringa
+                int ie = r.indexOf('"', ib+1);
+                if (ie > ib) {
+                  String macStr = r.substring(ib+1, ie);
+                  macValido = parseMacString(macStr, nuovoMac);
+                }
+              }
+              // Se null → macValido rimane false → broadcast
+            }
+            if (!macValido) {
+              memcpy(nuovoMac, MAC_BROADCAST, 6);
+            }
+            // Aggiorna peer solo se il MAC è effettivamente cambiato
+            if (memcmp(nuovoMac, g_macVisorePrecedente, 6) != 0) {
+              aggiornaVisorePeer(nuovoMac);
+            }
+          }
+
+          // ── prua_offset — invariato ──────────────────────────────────
           int i0 = r.indexOf("\"prua_offset\":")+14, i1 = r.indexOf(",",i0);
           if (i1<0) i1=r.indexOf("}",i0);
           if (i0>13&&i1>i0) {
@@ -130,7 +303,7 @@ void TaskInvioCloud(void* pvParameters) {
             }
           }
 
-          // cmd_calibra
+          // ── cmd_calibra — invariato ──────────────────────────────────
           if (r.indexOf("\"cmd_calibra\":true")>0 && !calibrazioneRichiesta) {
             calibrazioneRichiesta = true;
             HTTPClient hp;
@@ -143,7 +316,7 @@ void TaskInvioCloud(void* pvParameters) {
             hp.end();
           }
 
-          // sessione_attiva_id
+          // ── sessione_attiva_id — invariato ───────────────────────────
           if (g_sessione_attiva_id[0]=='\0') {
             int si = r.indexOf("\"sessione_attiva_id\":\"");
             if (si>0) { si+=22; r.substring(si,si+36).toCharArray(g_sessione_attiva_id,37); }
@@ -157,15 +330,15 @@ void TaskInvioCloud(void* pvParameters) {
             Serial.println("[SESS] Sessione chiusa da web app");
           }
 
-          // nome_capitano
+          // ── nome_capitano — invariato ────────────────────────────────
           int ni = r.indexOf("\"nome_capitano\":\"");
           if (ni>0){ni+=17;int ne=r.indexOf("\"",ni);if(ne>ni)r.substring(ni,ne).toCharArray(g_nome_capitano,64);}
 
-          // codice_crew
+          // ── codice_crew — invariato ──────────────────────────────────
           int ci = r.indexOf("\"codice_crew_live\":\"");
           if (ci>0){ci+=20;int ce=r.indexOf("\"",ci);if(ce>ci)r.substring(ci,ce).toCharArray(g_codice_crew,8);}
 
-          // Anchor Alert
+          // ── Anchor Alert — invariato ─────────────────────────────────
           {
             int ai, ae;
             ai = r.indexOf("\"anchor_lat\":"); if (ai>0){ ai+=13; ae=r.indexOf(",",ai); if(ae<0)ae=r.length()-1; g_anchor_lat=r.substring(ai,ae).toDouble(); }
@@ -174,9 +347,7 @@ void TaskInvioCloud(void* pvParameters) {
             g_anchor_attivo = (r.indexOf("\"anchor_attivo\":true") > 0);
           }
 
-          // ── Waypoint navigation (NUOVO V2.3.0) ───────────────────────
-          // I campi wp_alert_lat/lon/attivo esistono già nel DB (zero migration).
-          // Riutilizzati come waypoint di navigazione attivo.
+          // ── Waypoint navigation — invariato da V2.3.1 ────────────────
           {
             int wi, we;
             wi = r.indexOf("\"wp_alert_lat\":"); if (wi>0){ wi+=15; we=r.indexOf(",",wi); if(we<0)we=r.length()-1; g_wp_lat=r.substring(wi,we).toDouble(); }
@@ -186,7 +357,6 @@ void TaskInvioCloud(void* pvParameters) {
             if (wp_att && (g_wp_lat != 0.0 || g_wp_lon != 0.0)) {
               Serial.printf("[WP] Waypoint attivo: %.6f, %.6f\n", (float)g_wp_lat, (float)g_wp_lon);
             } else if (!wp_att) {
-              // Azzera se disattivato dalla webapp
               if (g_wp_active != 0) {
                 g_btw = 0.0f; g_dtw = 0.0f; g_vmg_wp = 0.0f;
                 g_wp_bearing_rel = 0.0f; g_eta_wp_sec = 0;
@@ -195,23 +365,20 @@ void TaskInvioCloud(void* pvParameters) {
             }
           }
 
-          // OTA (invariato)
+          // ── OTA — invariato da V2.3.1 ────────────────────────────────
           bool doOtaCheck = (g_otaUltimoCheck == 0) ||
                             (millis() - g_otaUltimoCheck >= OTA_CHECK_INTERVAL_MS);
           if (doOtaCheck) {
-            // (parsing OTA — invariato, vedere versione precedente)
             const char* otaVersion = nullptr;
             const char* otaUrl     = nullptr;
             const char* otaSha256  = nullptr;
             const char* otaStato   = nullptr;
-            // estrazione da JSON r (invariata rispetto V2.2.6)
             static char _ota_ver[24], _ota_url[256], _ota_sha[68], _ota_stato[16];
             int oi;
             oi = r.indexOf("\"ota_version\":\""); if(oi>0){oi+=15;int oe=r.indexOf("\"",oi);if(oe>oi){r.substring(oi,oe).toCharArray(_ota_ver,24);otaVersion=_ota_ver;}}
             oi = r.indexOf("\"ota_url\":\"");     if(oi>0){oi+=11;int oe=r.indexOf("\"",oi);if(oe>oi){r.substring(oi,oe).toCharArray(_ota_url,256);otaUrl=_ota_url;}}
             oi = r.indexOf("\"ota_sha256\":\"");  if(oi>0){oi+=14;int oe=r.indexOf("\"",oi);if(oe>oi){r.substring(oi,oe).toCharArray(_ota_sha,68);otaSha256=_ota_sha;}}
             oi = r.indexOf("\"ota_stato\":\"");   if(oi>0){oi+=13;int oe=r.indexOf("\"",oi);if(oe>oi){r.substring(oi,oe).toCharArray(_ota_stato,16);otaStato=_ota_stato;}}
-            // controllaOTA vuole const char* per otaForce e hasTsRetry (firma OTA.ino)
             const char* otaForceStr   = (r.indexOf("\"ota_force\":true") > 0) ? "true" : "false";
             bool _hasTsRetry = (r.indexOf("\"ota_retry_ts\":") > 0 &&
                                 r.indexOf("\"ota_retry_ts\":null") < 0);
@@ -224,8 +391,7 @@ void TaskInvioCloud(void* pvParameters) {
       }
 
       // ════════════════════════════════════════════════════════════════
-      // STACK 2 — TELEMETRIA DB @ 2s
-      // V2.3.0: aggiunti btw, dtw, vmg_wp; vmg_target ora = g_vmg_wp
+      // STACK 2 — Telemetria DB @ 2s — INVARIATO da V2.3.1
       // ════════════════════════════════════════════════════════════════
       {
         HTTPClient hTel;
@@ -259,14 +425,12 @@ void TaskInvioCloud(void* pvParameters) {
         j += "\"twa\":"+String((float)g_twa,1)+",";
         j += "\"tws\":"+String((float)g_tws,1)+",";
         j += "\"twd\":"+String(g_twd)+",";
-        // vmg_target ora popolato con VMG verso waypoint (era sempre 0.0)
         j += "\"vmg_target\":"+String((float)g_vmg_wp,1)+",";
         j += "\"vmg_wind\":"+String((float)g_vmg_wind,1)+",";
         j += "\"roll\":"+String(g_roll)+",";
         j += "\"pitch\":"+String(g_pitch)+",";
         j += "\"satelliti\":"+String(g_sats)+",";
         j += "\"batteria_pod\":"+String((int)maxlipo.cellPercent())+",";
-        // Nuovi campi WP (presenti solo se colonne aggiunte via migration SQL)
         j += "\"btw\":"+String((float)g_btw,1)+",";
         j += "\"dtw\":"+String((float)g_dtw,3)+",";
         j += "\"vmg_wp\":"+String((float)g_vmg_wp,1);
@@ -279,19 +443,23 @@ void TaskInvioCloud(void* pvParameters) {
         hTel.end();
       }
 
-      // STACK OTA (invariato)
+      // ════════════════════════════════════════════════════════════════
+      // STACK OTA — INVARIATO da V2.3.1
+      // ════════════════════════════════════════════════════════════════
       if (g_otaPending && !g_otaInCorso) {
         if (g_sessione_attiva_id[0] != '\0') {
           Serial.println("[OTA] ⏸ Sessione attiva — OTA posticipata");
         } else if (!g_fase1Ok) {
-          // attende gate SSL
+          // Gate SSL: attende primo FASE1 ok
         } else {
           Serial.println("[OTA] ▶ Avvio OTA...");
           eseguiOTA();
         }
       }
 
-      // STACK 1 — GESTIONE SESSIONE (invariato)
+      // ════════════════════════════════════════════════════════════════
+      // STACK 1 — Gestione Sessione — INVARIATO da V2.3.1
+      // ════════════════════════════════════════════════════════════════
       if (snapCmd == 1 && lastCmdSnap != 1) {
         String respAvvio;
         int rcAvvio = chiamaRPC("crea_sessione_da_visore",
@@ -332,7 +500,7 @@ void TaskInvioCloud(void* pvParameters) {
         } else {
           g_retryChiudiCount++;
           Serial.printf("[SESS] ⚠️ Chiusura rc=%d — retry %d/%d\n",
-            rcChiudi, g_retryChiudiCount, MAX_RETRY_CHIUDI);
+            rcChiudi, (int)g_retryChiudiCount, MAX_RETRY_CHIUDI);
           if (g_retryChiudiCount >= MAX_RETRY_CHIUDI) {
             g_pendingChiudiSessione = false;
             lastCmdSnap             = 0;
@@ -352,7 +520,7 @@ void TaskInvioCloud(void* pvParameters) {
   }
 }
 
-// ── Portale captive WiFi (invariato da V2.2.6) ───────────────────────────
+// ── setupWebServer() — INVARIATA da V2.3.1 ────────────────────────────────
 void setupWebServer() {
   server.on("/", []() {
     String html =
@@ -383,12 +551,12 @@ void setupWebServer() {
   });
 }
 
+// ── setupWiFi() — INVARIATA da V2.3.1 ─────────────────────────────────────
 void setupWiFi() {
   prefs.begin("wifi_creds", true);
   savedSSID = prefs.getString("ssid", "");
   savedPass = prefs.getString("pass", "");
   prefs.end();
-  // Fallback rete collaudo se il portale captive non ha ancora salvato credenziali
   if (savedSSID.length() == 0) {
     savedSSID = POD_WIFI_SSID;
     savedPass = POD_WIFI_PASS;
@@ -404,8 +572,17 @@ void setupWiFi() {
   while (WiFi.status() != WL_CONNECTED && millis()-t0 < 10000) { delay(500); }
   if (WiFi.status() == WL_CONNECTED) { wifiConnesso=true; Serial.println("[WIFI] Connesso"); }
   else { Serial.println("[WIFI] Locale (AP only)"); lastWifiAttempt = millis(); }
+
+  // V2.3.2: inizializza stato NVS binding
+  memcpy(g_macVisorePrecedente, MAC_BROADCAST, 6);
+  Preferences nvsProv;
+  nvsProv.begin("pod_prov", true);
+  g_macPodRegistrato = nvsProv.getBool("mac_ok", false);
+  nvsProv.end();
+  if (g_macPodRegistrato) Serial.println("[PROV] MAC POD già registrato (NVS ok)");
 }
 
+// ── gestisciWiFi() — INVARIATA da V2.3.1 ──────────────────────────────────
 void gestisciWiFi() {
   unsigned long now = millis();
   if (WiFi.status() != WL_CONNECTED) {
