@@ -2,6 +2,13 @@
 // AYE POD — AYE_POD_v37_DEV.ino  (file principale)
 // Release: V2.3.0
 //
+// Changelog V2.3.2 — Fix anemometro (PATCH):
+//   - AYE_POD_v37_DEV.ino: aggiunta Serial1.begin(WIND_BAUD_RATE, SERIAL_8N1, RX_PIN, TX_PIN)
+//     in setup() dopo setupGPS(). Era assente: leggiVento() leggeva da una porta non
+//     inizializzata → Serial1.available() restituiva sempre 0 → g_awa mai aggiornata
+//     → AWA/AWS/TWA/TWS sempre '--' su Visore e web app.
+//     WIND_BAUD_RATE=4800, RX_PIN=38, TX_PIN=39 (definiti in AYE_POD_v37_DEV.ino).
+//
 // Changelog V2.3.1 — Fix compilazione (PATCH):
 //   - Rete_Cloud.ino: aggiunto codice reale setupWiFi/gestisciWiFi/setupWebServer
 //     (erano placeholder — causava undeclared in setup/loop/Bussola.ino)
@@ -46,6 +53,8 @@
 //           Anemometro NMEA 0183 @ 4800 baud (RX=38, TX=39)
 // =========================================================================
 
+#include "secrets.h"        // NOME_POD, SUPABASE_URL, SUPABASE_KEY — deve stare qui
+                             // PRIMA di OTA.ino nell'ordine alfabetico di compilazione
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Adafruit_BNO08x.h>
@@ -61,8 +70,8 @@
 // ── Versionamento SemVer ──────────────────────────────────────────────────
 #define FW_VERSION_MAJOR 2
 #define FW_VERSION_MINOR 3
-#define FW_VERSION_PATCH 1
-#define FW_VERSION "2.3.1"
+#define FW_VERSION_PATCH 3
+#define FW_VERSION "2.3.3"
 
 #ifndef PIN_NEOPIXEL
   #define PIN_NEOPIXEL 33
@@ -215,6 +224,12 @@ void setup() {
 
   setupBussola();        // BNO085 @ 0x4A
   setupGPS();            // PA1010D @ 0x10 — 5Hz+SBAS
+
+  // Serial1: anemometro NMEA 0183 @ 4800 baud (RX=38, TX=39)
+  // CRITICO: senza questa riga leggiVento() non riceve nulla → AWA/AWS/TWS/TWA sempre '--'
+  Serial1.begin(WIND_BAUD_RATE, SERIAL_8N1, RX_PIN, TX_PIN);
+  Serial.printf("[VENTO] Serial1 @ %d baud RX=%d TX=%d\n", WIND_BAUD_RATE, RX_PIN, TX_PIN);
+
   setupWiFi();
   setupESPNOW();
 

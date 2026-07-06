@@ -7,7 +7,7 @@ Segnalare un Bug
 Apri una Issue su GitHub con:
 
 
-Versione firmware (es. 2.2.6)
+Versione firmware (es. 2.3.3)
 Descrizione del comportamento osservato
 Log seriale se disponibile (115200 baud)
 
