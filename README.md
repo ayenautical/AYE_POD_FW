@@ -61,7 +61,7 @@ Schema **SemVer** (MAJOR.MINOR.PATCH):
 ## OTA (Over-The-Air Update)
 
 Il firmware supporta aggiornamenti remoti via **GitHub Releases + Supabase**:
-- Il DB Supabase contiene `ota_version`, `ota_url`, `ota_sha256`
+- Il DB S contiene `ota_version`, `ota_url`, `ota_sha256`
 - Il POD confronta la versione al boot e ogni 72h
 - Download con verifica SHA256 byte-per-byte
 - Dual-slot ESP32: rollback automatico in caso di errore

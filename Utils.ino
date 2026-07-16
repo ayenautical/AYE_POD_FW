@@ -47,7 +47,8 @@ void stampaTelemetria() {
   Serial.printf(
     "[TEL V%s] HDG:%3d | SOG:%4.1f | COG:%3d | Dr:%+.0f | "
     "AWA:%+4.0f AWS:%4.1f | TWA:%+4.0f TWS:%4.1f | "
-    "VMGw:%.1f | SATS:%d | GPS_age:%lums | BNOacc:%.2f | ACC:%d\n",
+    "VMGw:%.1f | SATS:%d | GPS_age:%lums | BNOacc:%.2f | ACC:%d | "
+    "RAW:%4.1f | axPP:%.2f ayPP:%.2f | HDOP:%.1f FQ:%d/%d\n",
     FW_VERSION,
     g_head, (float)g_sog, (int)g_cog, (float)g_drift,
     (float)g_awa, (float)g_aws,
@@ -55,7 +56,11 @@ void stampaTelemetria() {
     (float)g_vmg_wind,
     g_sats, gpsAgeMs(),
     (float)g_accel_mag_media,
-    g_acc
+    g_acc,
+    (float)g_sog_raw,
+    (float)(g_ax_max - g_ax_min),
+    (float)(g_ay_max - g_ay_min),
+    (float)g_hdop, (int)g_fixq, (int)g_fixq3d
   );
 
   // ── Waypoint navigation (V2.3.0) ────────────────────────────────────

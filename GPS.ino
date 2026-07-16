@@ -80,6 +80,8 @@
 #define GPS_BUF_N           8      // campioni buffer SOG
 #define COG_CONFIRM_MIN     3      // cicli SOG>0 per aggiornare COG
 #define KALMAN_WARM_MS   180000UL  // ms: 3 min per Kalman HW convergito
+#define GPS_FIX_GRACE_MS  15000UL  // V2.4.2: ms di assenza fix oltre i quali
+                                   // il warm-up Kalman riparte da zero
 #define SOG_MIN_KN          0.50f  // kn: gate finale — sotto questa soglia SOG=0
 
 // ── GPS Consistency Check ─────────────────────────────────────────────────
@@ -271,19 +273,45 @@ void leggiGPS() {
   }
 
   g_sats = GPS.satellites;
+  // ── V2.4.2 — Qualita' fix (logging only, nessun uso nel filtro) ──────
+  g_hdop   = (float)GPS.HDOP;
+  g_fixq   = GPS.fixquality;
+  g_fixq3d = GPS.fixquality_3d;
 
   if (!GPS.fix || g_sats < 4) {
     g_sog = 0.0f;
-    _gps_first_fix_ms = 0;
+    g_sog_raw = 0.0f;              // V2.4.0: debug
+    // ── V2.4.2 — FIX: grace period sul warm-up Kalman ─────────────────
+    // BUG V2.4.1: qualsiasi dropout di fix, anche di 1 ciclo, azzerava il
+    // timer -> i 180s di warm-up ripartivano da zero. Evidenza test balcone 2
+    // (sessione 7a8204d2, FW 2.4.1): 9 perdite di fix in 13 min -> filtro
+    // attivo solo sul 15% dei punti (41/274).
+    // Il Kalman HW del PA1616S non perde la convergenza per un buco di 2s:
+    // azzeriamo il timer solo dopo GPS_FIX_GRACE_MS di assenza continua.
+    if (_gps_last_fix_ms != 0 &&
+        (millis() - _gps_last_fix_ms) > GPS_FIX_GRACE_MS) {
+      _gps_first_fix_ms = 0;
+    }
     return;
   }
 
   unsigned long now = millis();
-  if (g_sats >= 6) {
-    if (_gps_first_fix_ms == 0) _gps_first_fix_ms = now;
-  } else {
-    _gps_first_fix_ms = 0;
-  }
+
+  // ── V2.4.1 — FIX: avvio timer Kalman ────────────────────────────────
+  // BUG V2.4.0 e precedenti: il timer partiva solo con sats>=6 e veniva
+  // AZZERATO a ogni ciclo con sats 4-5. Con 5 satelliti stabili
+  // kalman_caldo non diventava MAI true -> STRATO 1 restituiva raw
+  // all'infinito e gli strati 0/2/3/4 non venivano MAI raggiunti.
+  // Evidenza test balcone 15/07 (sessione fe4405a6, 293 punti, sats=5):
+  //   0 punti azzerati dal filtro, sog == raw sempre, picco 7.39 kn da fermo.
+  // In mare: 9.6% dei punti (6460/67379) girava senza filtro.
+  //
+  // CORREZIONE: il timer parte al primo fix valido (>=4 sats, stessa
+  // condizione del guard sopra) e si azzera SOLO alla perdita di fix.
+  // Il Kalman HW del PA1616S converge in funzione del TEMPO di fix
+  // continuo, non del conteggio istantaneo di satelliti: una fluttuazione
+  // 6->5 non azzera la convergenza gia' raggiunta.
+  if (_gps_first_fix_ms == 0) _gps_first_fix_ms = now;
   _gps_last_fix_ms = now;
 
   // ── Timestamp UTC da NMEA ────────────────────────────────────────────
@@ -293,6 +321,7 @@ void leggiGPS() {
   }
 
   float raw_sog = GPS.speed;         // knots da $GPRMC
+  g_sog_raw = raw_sog;               // V2.4.0: debug — SOG pre-filtro
   float raw_lat = GPS.latitudeDegrees;
   float raw_lon = GPS.longitudeDegrees;
   float raw_cog = GPS.angle;         // COG da $GPRMC (track made good)
