@@ -85,6 +85,20 @@ void leggiBussola() {
       // Campione 2D istantaneo (per telemetria debug)
       g_accel_mag = sqrtf(ax*ax + ay*ay);
 
+      // ── V2.4.0 — Accumulo min/max ax/ay su finestra 2s (debug) ──────
+      // Cattura l'ampiezza dell'oscillazione da rollio/beccheggio, invisibile
+      // a un campionamento istantaneo ogni 2s. Nessun impatto sul filtro SOG.
+      if (g_acc_win_reset) {
+        g_ax_min = ax; g_ax_max = ax;
+        g_ay_min = ay; g_ay_max = ay;
+        g_acc_win_reset = false;
+      } else {
+        if (ax < g_ax_min) g_ax_min = ax;
+        if (ax > g_ax_max) g_ax_max = ax;
+        if (ay < g_ay_min) g_ay_min = ay;
+        if (ay > g_ay_max) g_ay_max = ay;
+      }
+
       // Media mobile 2D — filtra vibrazioni ad alta frequenza
       static float win[BNO_ACCEL_WIN];
       static uint8_t idx=0, cnt=0;
